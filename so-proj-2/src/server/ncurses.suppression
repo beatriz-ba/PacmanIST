@@ -1,0 +1,6 @@
+{
+    ignore_libncurses Memcheck : Leak... obj : */ libncurses *
+}
+{
+    ignore_libtinfo Memcheck : Leak... obj : */ libtinfo *
+}
