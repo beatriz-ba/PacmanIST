@@ -1,0 +1,194 @@
+#include "api.h"
+#include "debug.h"
+#include "display.h"
+#include "protocol.h"
+
+#include <ctype.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+Board board;
+bool stop_execution = false;
+int tempo;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void *receiver_thread(void *arg) {
+    (void)arg; // Ignora o argumento não utilizado
+
+    while (true) {
+        // Recebe a atualização do tabuleiro do servidor
+        Board *board = receive_board_update();
+
+        if (board == NULL) {
+            debug("receive_board_update returned NULL (Pipe likely closed)\n");
+            pthread_mutex_lock(&mutex);
+            stop_execution = true;
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        debug("received board updates\n");
+
+        debug("game over = %d\n", board->game_over);
+
+        // Verifica se os dados do tabuleiro são inválidos ou se o jogo terminou
+        if (!board->data || board->game_over == 1) {
+            if (!board->data)
+                debug("data invalid\n");
+            else
+                debug("end of game\n");
+
+            // Desenha uma ultima vez para mostrar game over
+            if (board->data) {
+                draw_board_client(*board);
+                refresh_screen();
+            }
+
+            pthread_mutex_lock(&mutex);
+            stop_execution = true; // Sinaliza para parar a execução do cliente
+            pthread_mutex_unlock(&mutex);
+            break; // Sai do loop
+        }
+
+        // Atualiza a variável global 'tempo' de forma segura (thread-safe)
+        pthread_mutex_lock(&mutex);
+        tempo = board->tempo;
+        pthread_mutex_unlock(&mutex);
+
+        // Desenha o tabuleiro no ecrã do cliente
+        debug("starting drawing board\n");
+        draw_board_client(*board);
+        debug("board drawed\n");
+        refresh_screen();
+    }
+
+    debug("Returning receiver thread...\n");
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    // Verifica se o número de argumentos é válido
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr,
+                "Usage: %s <client_id> <register_pipe> [commands_file]\n",
+                argv[0]);
+        return 1;
+    }
+
+    // Atribui os argumentos a variáveis para facilitar o uso
+    const char *client_id = argv[1];
+    const char *register_pipe = argv[2];
+    const char *commands_file = (argc == 4) ? argv[3] : NULL;
+
+    // Se um ficheiro de comandos foi fornecido, tenta abri-lo
+    FILE *cmd_fp = NULL;
+    if (commands_file) {
+        cmd_fp = fopen(commands_file, "r");
+        if (!cmd_fp) {
+            perror("Failed to open commands file");
+            return 1;
+        }
+    }
+
+    // Define buffers para armazenar os caminhos dos pipes
+    char req_pipe_path[MAX_PIPE_PATH_LENGTH];
+    char notif_pipe_path[MAX_PIPE_PATH_LENGTH];
+
+    // Constrói o caminho do pipe de requisição usando o ID do cliente
+    snprintf(req_pipe_path, MAX_PIPE_PATH_LENGTH, "/tmp/%s_request", client_id);
+
+    // Constrói o caminho do pipe de notificação usando o ID do cliente
+    snprintf(notif_pipe_path, MAX_PIPE_PATH_LENGTH, "/tmp/%s_notification",
+             client_id);
+
+    // Abre o ficheiro de debug para registar logs
+    char debug_file[256];
+    sprintf(debug_file, "client-debug%s.log", client_id);
+    open_debug_file(debug_file);
+
+    if (pacman_connect(req_pipe_path, notif_pipe_path, register_pipe) != 0) {
+        perror("Failed to connect to server ");
+        return 1;
+    }
+
+    debug("receiver thread created\n");
+    pthread_t receiver_thread_id;
+    pthread_create(&receiver_thread_id, NULL, receiver_thread, NULL);
+
+    terminal_init();
+    set_timeout(500);
+    draw_board_client(board);
+    refresh_screen();
+
+    char command;
+    int ch;
+
+    while (1) {
+
+        pthread_mutex_lock(&mutex);
+        if (stop_execution) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+        pthread_mutex_unlock(&mutex);
+
+        if (cmd_fp) {
+            // Input from file
+            ch = fgetc(cmd_fp);
+
+            if (ch == EOF) {
+                // Restart at the start of the file
+                rewind(cmd_fp);
+                continue;
+            }
+
+            command = (char)ch;
+
+            if (command == '\n' || command == '\r' || command == '\0')
+                continue;
+
+            command = toupper(command);
+
+            // Wait for tempo, to not overflow pipe with requests
+            pthread_mutex_lock(&mutex);
+            int wait_for = tempo;
+            pthread_mutex_unlock(&mutex);
+            sleep_ms(wait_for);
+
+        } else {
+            // Interactive input
+            debug("receiving input from client\n");
+            command = get_input();
+            command = toupper(command);
+        }
+
+        if (command == '\0')
+            continue;
+
+        if (command == 'Q') {
+            debug("Client pressed 'Q', quitting game\n");
+            break;
+        }
+
+        debug("Command: %c\n", command);
+
+        pacman_play(command);
+    }
+
+    pacman_disconnect();
+    debug("thread join");
+    pthread_join(receiver_thread_id, NULL);
+
+    if (cmd_fp)
+        fclose(cmd_fp);
+
+    pthread_mutex_destroy(&mutex);
+
+    terminal_cleanup();
+
+    return 0;
+}
